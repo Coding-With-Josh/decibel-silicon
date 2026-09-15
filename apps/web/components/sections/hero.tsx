@@ -72,12 +72,12 @@ export const Hero = () => {
         ref={stickyRef}
         className="hero-dark sticky top-0 z-30 h-screen w-full overflow-hidden pointer-events-none"
       >
-        <section className="flex w-full flex-col items-start justify-between px-4 pt-40">
-          <h1 className="text-black font-serif text-[8rem] font-semibold">
+        <section className="flex w-full flex-col items-start justify-between px-4 pt-24 md:pt-40">
+          <h1 className="text-black font-serif text-[3.5rem] md:text-[8rem] font-semibold">
             Decibel Silicon
           </h1>
           <div className="flex max-w-xl flex-col items-start gap-8">
-            <p className="text-black text-2xl font-medium opacity-90 tracking-[-0.02em]">
+            <p className="text-black text-lg md:text-2xl font-medium opacity-90 tracking-[-0.02em]">
               Low-power AI chips for hearing aids. Silicon, DSP, and firmware
               designed in-house for real-time audio clarity at milliwatt
               budgets.
@@ -93,7 +93,7 @@ export const Hero = () => {
             </a>
           </div>
         </section>
-        <h1 className="font-sans tracking-[-0.06em] font-black text-[8rem] text-black/20 absolute bottom-0 right-3">COMING SOON</h1>
+        <h1 className="font-sans tracking-[-0.06em] font-black text-[3.5rem] md:text-[8rem] text-black/20 absolute bottom-0 right-3">COMING SOON</h1>
         <ImageSection sectionRef={imageRef} />
       </div>
     </div>
