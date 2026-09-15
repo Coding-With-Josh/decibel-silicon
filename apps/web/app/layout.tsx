@@ -1,6 +1,8 @@
 import type { Metadata } from "next";
 import { instrumentSans, obsydia } from "./fonts";
 import { SmoothScroll } from "@/components/smooth-scroll";
+import { Analytics } from "@vercel/analytics/react";
+import { SpeedInsights } from "@vercel/speed-insights/react";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -39,6 +41,8 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <body className="min-h-full flex flex-col font-sans bg-orange-500">
         <SmoothScroll />
         {children}
+        <Analytics />
+        <SpeedInsights />
       </body>
     </html>
   );
