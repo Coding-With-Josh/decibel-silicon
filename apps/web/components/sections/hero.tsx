@@ -72,7 +72,7 @@ export const Hero = () => {
         ref={stickyRef}
         className="hero-dark sticky top-0 z-30 h-screen w-full overflow-hidden pointer-events-none"
       >
-        <section className="pointer-events-auto flex w-full flex-col items-start justify-between px-4 pt-40">
+        <section className="flex w-full flex-col items-start justify-between px-4 pt-40">
           <h1 className="text-black font-serif text-[8rem] font-semibold">
             Decibel Silicon
           </h1>
@@ -86,13 +86,14 @@ export const Hero = () => {
               href="https://youtu.be/pYhklpquIPY"
               target="_blank"
               rel="noreferrer"
-              className="flex items-center justify-center px-5 py-2 bg-black text-orange-200 font-sans tracking-tight"
+              className="pointer-events-auto flex items-center justify-center px-5 py-2 bg-black text-orange-200 font-sans tracking-tight"
             >
               check out our blueprint application video
               <ArrowUpRight className="ml-2 inline-block size-3.5" />
             </a>
           </div>
         </section>
+        <h1 className="font-sans tracking-[-0.06em] font-black text-[8rem] text-black/20 absolute bottom-0 right-3">COMING SOON</h1>
         <ImageSection sectionRef={imageRef} />
       </div>
     </div>
