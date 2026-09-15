@@ -18,3 +18,16 @@
     --foreground: #ededed;
   }
 }
+
+/* Black-veil darkening for the pinned hero: a pseudo-element (no DOM node,
+   no overlay div), opacity driven by --hero-dark which the hero component
+   sets from scroll progress. Sits above hero content (z-0) but below the
+   rising image section (z-20). */
+.hero-dark::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  /* background: rgba(0, 0, 0, var(--hero-dark, 0)); */
+  pointer-events: none;
+}
