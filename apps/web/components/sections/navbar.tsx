@@ -5,7 +5,7 @@ import React from "react";
 
 export const Navbar = () => {
   return (
-    <div className="fixed z-100 w-screen flex items-center justify-between backdrop-blur-md py-4 px-8 bg-orange-500 0 text-white">
+    <div className="fixed z-20 w-screen flex items-center justify-between backdrop-blur-md py-4 px-8 bg-orange-500 0 text-white">
      <Link href="https://youtu.be/pYhklpquIPY" target="_blank" rel="noopener noreferrer">
          <button className=" flex items-center justify-center px-5 py-2 bg-black text-orange-200 font-sans tracking-tight active:scale-98 hover:scale-102">
         <span>Blueprint Application</span>
