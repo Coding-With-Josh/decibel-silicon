@@ -130,6 +130,17 @@ not by taste:
   was α=1, not the α=2 default) — the canonical Berouti SNR→α guidance [2]
   also *decreases* α as SNR rises.
 
+**Mapping-shape caveat (read before quoting):** the tent shape — α_eff
+*peaking* at mid SNR and relaxing toward `alpha_min` at BOTH extremes — is
+**this project's empirical finding on this specific synthetic test signal,
+not a literature-standard Berouti curve.** The classical Berouti guidance is
+monotonically *decreasing* in SNR (more aggressive subtraction at low SNR,
+less at high); this project's low-SNR relaxation is a defensible departure
+(over-subtraction destroying buried speech at very low SNR is a documented
+failure mode — see Measured result below), but nobody should read this doc
+as claiming the tent is textbook. If a future signal/corpus shows the low-SNR
+relaxation is wrong, the map is a config (slope/min/max/ref), not a rewrite.
+
 snr_est_db is the eps-guarded ratio of smoothed-mixture energy to the
 noise-estimate energy (a fixed-point-cheap global measure; the meter floor
 is 0 dB, so cells below ~−10 dB real SNR read ≈0 dB and land on alpha_min —
@@ -200,10 +211,12 @@ arithmetic and alpha map never run.
    record for the ICASSP '79 paper)*
 3. Martin, R. (2001). Noise power spectral density estimation based on
    optimal smoothing and minimum statistics. *IEEE Trans. Speech and Audio
-   Processing*, 9(5), 504–512. *(record verified against multiple library
-   citations; the commonly-cited DOI 10.1109/89.928615 is NOT resolvable via
-   Crossref as of 2026-09-16 — old IEEE DOIs predate the Crossref deposit —
-   so cited without a live DOI.)*
+   Processing*, 9(5), 504–512. doi:10.1109/89.928915 *(verified resolves via
+   Crossref API 2026-09-16; title/venue match. Correction: an earlier draft
+   cited 10.1109/89.928615 — a transposed digit — and wrongly concluded the
+   old IEEE record predates the Crossref deposit; a 404 and a typo produce
+   identical symptoms, so the fix is re-search + digit-by-digit comparison,
+   not "record missing".)*
 4. Taal, C. H., Hendriks, R. C., Heusdens, R., & Jensen, J. (2011). An
    algorithm for intelligibility prediction of time-frequency weighted noisy
    speech. *IEEE Trans. Audio, Speech, and Language Processing*, 19(7),

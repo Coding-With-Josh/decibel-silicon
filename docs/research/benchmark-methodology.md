@@ -163,3 +163,42 @@ but skips subtraction + alpha map: 15,258 cycles → 19.76 µW per frame (vs
 16,566 / 21.46 µW all-subtract). A real stream mixes both, so the benchmark
 prints the worst case, the bypass case, AND the measured bypassed/ACTIVE
 counts — never one disguised number.
+# Real-speech bridge: LibriSpeech + DEMAND (normal-hearing proxy)
+
+Same adaptive v2 default on **real speech + real noise** — read of the
+synthetic-only findings. Corpus: 3 concatenated LibriSpeech dev-clean
+sentences (23.16 s, CC-BY 4.0) + 15 s of DEMAND `DKITCHEN` channel 1
+(CC-BY 4.0); 16 kHz mono; files in `dsp/corpus/`; provenance in
+`dsp/corpus/README.md`. Reproduce:
+
+```sh
+dsp/.venv/bin/python dsp/benchmark.py \
+  --clean dsp/corpus/librispeech_clean_3sent.wav \
+  --noise  dsp/corpus/demand_dkitchen_noise_15s.wav \
+  --corpus-name "LibriSpeech + DEMAND (CC-BY 4.0)" \
+  --snr-db 0
+```
+
+| SNR | STOI in | ΔSTOI | ΔsegSNR | notes |
+|---|---|---|---|---|
+| 0 dB | 0.915 | −0.017 | +4.9 dB | real babble damages STOI far less than AM synthetic (0 dB synthetic in = 0.230); segSNR wins big |
+| 5 dB | 0.952 | −0.013 | +3.1 dB | small STOI cost, solid segSNR gain |
+| 10 dB | 0.969 | −0.012 | +1.0 dB | |
+| 15 dB | 0.978 | −0.008 | −0.8 dB | |
+| 20 dB | 0.982 | −0.003 | −1.5 dB | small losses both ways |
+| 20 dB, bypass@15 | 0.982 | −0.007 | −0.7 dB | 687/3751 ACTIVE frames bypassed (identity) — only 18% exceed 15 dB meter on real noise |
+
+Every row is labeled in the JSON output as `real speech (corpus: LibriSpeech
++ DEMAND (CC-BY 4.0))` — no instance of these numbers can be quoted as the
+synthetic or the impaired-hearing result. The bypass cell is deliberately
+mixed: on real kitchen babble the short-time SNR meter stays below 15 dB for
+most frames even at 20 dB input, so bypass helps segSNR but the not-yet-
+thresholded frames still eat a little STOI. Same honest label as inside the
+algorithm docs: real-speech bridge replaces the synthetic *input*, it does
+not claim impaired-hearing benefit.
+
+**Explicit non-claim:** these are normal-hearing proxy metrics. The
+impaired-hearing step (HASPI/HAAQI on the aided receive chain, or listener
+testing with a prescribed gain target) is the named **open next step**; until
+it runs, nothing in this repo claims the algorithm improves anything a
+hearing-aid wearer perceives.

@@ -161,11 +161,14 @@ def mix_at_snr(clean: np.ndarray, noise: np.ndarray, snr_db: float) -> np.ndarra
 
 def segmental_snr(clean: np.ndarray, processed: np.ndarray, fs: int,
                   frame_ms: int = 30, hop_ms: int = 10,
-                  snr_min: float = -10.0, snr_max: float = 35.0) -> dict:
+                  snr_min: float = -10.0, snr_max: float = 35.0,
+                  source_kind: str = "synthetic signal") -> dict:
     """Per-frame SNR over speech-active frames, clipped to [snr_min, snr_max].
 
     Same frame geometry as the STOI proxy; returns the label + the value so
-    callers always surface the proxy/measurement distinction.
+    callers always surface the proxy/measurement distinction. The label
+    carries the source kind so a real-corpus run is never quoted as the
+    synthetic result.
     """
     frame = int(fs * frame_ms / 1000)
     hop = int(fs * hop_ms / 1000)
@@ -181,15 +184,16 @@ def segmental_snr(clean: np.ndarray, processed: np.ndarray, fs: int,
         vals.append(float(np.clip(snr, snr_min, snr_max)))
     value = float(np.mean(vals)) if vals else float("nan")
     return {"value": value, "n_frames": len(vals),
-            "label": "measured proxy (segmental SNR)"}
+            "label": f"measured proxy (segmental SNR, {source_kind})"}
 
 
-def stoi_proxy(clean: np.ndarray, processed: np.ndarray, fs: int) -> dict:
+def stoi_proxy(clean: np.ndarray, processed: np.ndarray, fs: int,
+               source_kind: str = "synthetic signal") -> dict:
     """STOI (Taal et al. 2011) via pystoi. Degrades WITH LABEL, never crashes.
 
     Phase 2 fallback rule: if pystoi is unavailable or rejects the signal,
     return value=None and a reason; the caller must surface the absence
-    rather than fabricate a number.
+    rather than fabricate a number. The label carries the source kind.
     """
     try:
         from pystoi import stoi
@@ -202,7 +206,7 @@ def stoi_proxy(clean: np.ndarray, processed: np.ndarray, fs: int) -> dict:
         return {"value": None, "reason": f"pystoi rejected signal: {exc}",
                 "label": "unavailable"}
     return {"value": value, "reason": None,
-            "label": "measured proxy (STOI, pystoi, synthetic signal)"}
+            "label": f"measured proxy (STOI, pystoi, {source_kind})"}
 
 
 # --------------------------------------------------------------------------
@@ -341,11 +345,25 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         min_len = min(clean.size, noise.size)
         clean, noise = clean[:min_len], noise[:min_len]
         clean = clean / (np.max(np.abs(clean)) or 1.0)
-        signal_note = "user-supplied wav files (label source corpus before quoting)"
+        if args.corpus_name:
+            source_kind = f"real speech (corpus: {args.corpus_name})"
+            signal_note = (
+                f"real-speech corpus [{args.corpus_name}], "
+                "normal-hearing proxy metrics on user-supplied wav files; "
+                "NOT impaired-hearing validation (HASPI/HAAQI or listener "
+                "testing is the open next step, not claimed here)"
+            )
+        else:
+            source_kind = "real speech (user-supplied wav files)"
+            signal_note = (
+                "user-supplied wav files (label the corpus before quoting; "
+                "normal-hearing proxy metrics only)"
+            )
     else:
         sig_src = f"synthetic (seed={args.seed})"
         clean = synthesize_speech_like(fs, args.duration_s, seed=args.seed)
         noise = synthesize_babble_noise(fs, args.duration_s, seed=args.seed + 1)
+        source_kind = "synthetic signal"
         signal_note = _SPEC_LIKE_CAVEAT
 
     noisy = mix_at_snr(clean, noise, args.snr_db)
@@ -380,10 +398,10 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         raise ValueError("signal too short after warm-up exclusion; "
                          "increase --duration-s")
 
-    stoi_in = stoi_proxy(c, nz, fs)
-    stoi_out = stoi_proxy(c, proc, fs)
-    seg_in = segmental_snr(c, nz, fs)
-    seg_out = segmental_snr(c, proc, fs)
+    stoi_in = stoi_proxy(c, nz, fs, source_kind=source_kind)
+    stoi_out = stoi_proxy(c, proc, fs, source_kind=source_kind)
+    seg_in = segmental_snr(c, nz, fs, source_kind=source_kind)
+    seg_out = segmental_snr(c, proc, fs, source_kind=source_kind)
 
     # ---- power model ------------------------------------------------------
     est = estimate_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
@@ -431,6 +449,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         "ceiling_ms": pipeline.ceiling_ms,
         "preferred_ms": pipeline.preferred_ms,
         "snr_db": args.snr_db, "signal_source": sig_src,
+        "corpus_name": args.corpus_name,
         "duration_s": args.duration_s,
     }
     return BenchmarkResult(
@@ -582,6 +601,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="optional real clean-speech wav (mono)")
     parser.add_argument("--noise", type=Path, default=None,
                         help="optional noise wav (mono; must match --clean fs)")
+    parser.add_argument("--corpus-name", type=str, default=None,
+                        help="label the wav corpus for honest provenance, e.g. "
+                             "'LibriSpeech + DEMAND (CC-BY 4.0)' - surfaces in "
+                             "the metric labels and caveat")
     parser.add_argument("--json", type=Path, default=None,
                         help="write machine-readable labeled result here")
     parser.add_argument(
@@ -599,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if (args.clean is None) != (args.noise is None):
         parser.error("--clean and --noise must be supplied together")
+    if args.corpus_name and (args.clean is None or args.noise is None):
+        parser.error("--corpus-name requires --clean and --noise")
 
     if args.sweep:
         return _run_sweep(parser, args)
