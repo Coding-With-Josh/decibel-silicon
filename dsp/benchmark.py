@@ -37,7 +37,7 @@ from src.pipeline import (
     NoiseReductionPipeline,
     run_stream,
 )
-from src.power_model import estimate_power_mw
+from src.power_model import estimate_learned_power_mw, estimate_power_mw
 from src.spectral_subtraction import (
     DEFAULT_ADAPTIVE_ALPHA,
     DEFAULT_ALPHA,
@@ -308,8 +308,31 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         alpha_max=args.alpha_max,
         high_snr_bypass_db=args.high_snr_bypass_db,
     )
+
+    # ---- learned-gain model (dsp/learned) ---------------------------------
+    # Loaded BEFORE the pipeline is even constructed; a schema/shape/sanity
+    # failure here must abort the benchmark (exit 2) - never a silent fallback
+    # to the classical algorithm while labeling the run "learned" (Phase 2
+    # rule). gain_hook is a plain function-local here, so it is bound BEFORE
+    # the first NoiseReductionPipeline(...) below - no UnboundLocalError.
+    gain_hook = None
+    model_label = None
+    model_description = None
+    if args.gain_model:
+        if args.high_snr_bypass_db is not None:
+            raise ValueError(
+                "--gain-model and --high-snr-bypass-db are contradictory: the "
+                "learned model REPLACES the classical decision (including the "
+                "bypass), so the bypass flag would be dead config")
+        from learned import GainModelHook, load_model_npz
+        loaded = load_model_npz(args.gain_model)
+        gain_hook = GainModelHook(loaded)
+        model_label = "learned, float32 prototype, not yet quantized/on-target"
+        model_description = f"{loaded.describe()} ({args.gain_model})"
+
     pipeline = NoiseReductionPipeline(
         config=cfg, ceiling_ms=args.ceiling_ms, preferred_ms=args.preferred_ms,
+        gain_hook=gain_hook,
     )
 
     # ---- input signal -----------------------------------------------------
@@ -337,6 +360,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         )
         pipeline = NoiseReductionPipeline(
             config=cfg, ceiling_ms=args.ceiling_ms, preferred_ms=args.preferred_ms,
+            gain_hook=gain_hook,
         )
         if clean.ndim != 1 or noise.ndim != 1:
             raise ValueError("only mono wav files are supported")
@@ -404,9 +428,17 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
     seg_out = segmental_snr(c, proc, fs, source_kind=source_kind)
 
     # ---- power model ------------------------------------------------------
-    est = estimate_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
-                            tracking=cfg.noise_tracking,
-                            adaptive=cfg.adaptive_alpha)
+    if gain_hook is not None:
+        # Learned-gain endpoint: the GRU replaces the classical gain decision,
+        # so the combined estimate is the classical chain minus that decision
+        # plus the GRU+readout MACs (5 cycles/MAC, RV32IMC - see the caveat).
+        est = estimate_learned_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
+                                        tracking=cfg.noise_tracking,
+                                        adaptive=cfg.adaptive_alpha)
+    else:
+        est = estimate_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
+                                tracking=cfg.noise_tracking,
+                                adaptive=cfg.adaptive_alpha)
     power = {
         "value_mw": est.power_mw,
         "cycles_per_frame": est.cycles_per_frame,
@@ -417,6 +449,24 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         "crosscheck_uW_per_MHz_range": list(est.crosscheck_uW_per_MHz_range),
         "caveat": est.caveat,
     }
+    if gain_hook is not None:
+        # The GRU share is never hidden inside the headline: report the parts.
+        # shared_chain = everything BOTH algorithms do (WOLA/FFT/estimate);
+        # gru_decision_mw is the learned decision's ADDED cost over that chain
+        # (always >= 0); classical_decision_mw is the Berouti path it replaces.
+        est_class = estimate_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
+                                      tracking=cfg.noise_tracking,
+                                      adaptive=cfg.adaptive_alpha)
+        est_shared = estimate_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
+                                       tracking=cfg.noise_tracking,
+                                       adaptive=cfg.adaptive_alpha,
+                                       subtract=False)
+        power["classical_total_mw"] = est_class.power_mw
+        power["classical_decision_mw"] = (est_class.power_mw
+                                          - est_shared.power_mw)
+        power["shared_chain_mw"] = est_shared.power_mw
+        power["gru_decision_mw"] = est.power_mw - est_shared.power_mw
+        power["label"] = model_label
     if cfg.high_snr_bypass_db is not None:
         # Revision 2.1: report BOTH the all-subtract worst case (headline,
         # unchanged) and the per-frame cost when a frame IS bypassed, plus the
@@ -451,6 +501,11 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         "snr_db": args.snr_db, "signal_source": sig_src,
         "corpus_name": args.corpus_name,
         "duration_s": args.duration_s,
+        # Provenance: which algorithm produced these numbers (never ambiguous).
+        "algorithm": ("learned" if gain_hook is not None else "classical"),
+        "gain_model": (str(args.gain_model) if args.gain_model else None),
+        "gain_model_label": model_label,
+        "gain_model_description": model_description,
     }
     return BenchmarkResult(
         config=config_dict, power=power, latency=report,
@@ -544,6 +599,16 @@ def render_report(res: BenchmarkResult) -> str:
         lines.append("  through with gain=1 (exact identity), closing the residual")
         lines.append("  high-SNR segSNR loss (revision 2.1).")
     lines.append(f"  caveat     : {res.signal_note}")
+    if res.config.get("algorithm") == "learned":
+        lines.append("")
+        lines.append("  LEARNED-MODEL RUN (different decision, same WOLA chain):")
+        lines.append(f"    gain model     : {res.config.get('gain_model')}")
+        lines.append(f"    model label    : {res.config.get('gain_model_label')}")
+        lines.append(f"    description    : {res.config.get('gain_model_description')}")
+        lines.append(f"    power split    : shared chain {res.power['shared_chain_mw'] * 1000.0:.1f} uW "
+                     f"+ GRU decision {res.power['gru_decision_mw'] * 1000.0:.1f} uW "
+                     f"(classical decision it replaces: "
+                     f"{res.power['classical_decision_mw'] * 1000.0:.1f} uW)")
     lines.append("=" * 64)
     return "\n".join(lines)
 
@@ -603,8 +668,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="optional noise wav (mono; must match --clean fs)")
     parser.add_argument("--corpus-name", type=str, default=None,
                         help="label the wav corpus for honest provenance, e.g. "
-                             "'LibriSpeech + DEMAND (CC-BY 4.0)' - surfaces in "
-                             "the metric labels and caveat")
+                             "'LibriSpeech + DEMAND (CC BY-SA 3.0)' - surfaces "
+                             "in the metric labels and caveat")
+    parser.add_argument("--gain-model", type=Path, default=None,
+                        help="learned gain model npz (dsp/learned export). The "
+                             "model REPLACES the classical gain decision inside "
+                             "the same WOLA chain; JSON/print label the run as "
+                             "'learned'. Any load/schema error exits 2 - never "
+                             "a silent fallback to the classical algorithm.")
     parser.add_argument("--json", type=Path, default=None,
                         help="write machine-readable labeled result here")
     parser.add_argument(

@@ -167,15 +167,18 @@ counts — never one disguised number.
 
 Same adaptive v2 default on **real speech + real noise** — read of the
 synthetic-only findings. Corpus: 3 concatenated LibriSpeech dev-clean
-sentences (23.16 s, CC-BY 4.0) + 15 s of DEMAND `DKITCHEN` channel 1
-(CC-BY 4.0); 16 kHz mono; files in `dsp/corpus/`; provenance in
+sentences (23.16 s, CC BY 4.0) + 15 s of DEMAND `DKITCHEN` channel 2
+(DEMAND is **CC BY-SA 3.0** per the authors' `DEMAND.pdf`; the zenodo
+metadata field saying cc-by-4.0 is a depositor inconsistency — the more
+restrictive license governs derived slices);
+16 kHz mono; files in `dsp/corpus/`; provenance in
 `dsp/corpus/README.md`. Reproduce:
 
 ```sh
 dsp/.venv/bin/python dsp/benchmark.py \
   --clean dsp/corpus/librispeech_clean_3sent.wav \
   --noise  dsp/corpus/demand_dkitchen_noise_15s.wav \
-  --corpus-name "LibriSpeech + DEMAND (CC-BY 4.0)" \
+  --corpus-name "LibriSpeech + DEMAND (CC BY-SA 3.0)" \
   --snr-db 0
 ```
 
@@ -189,7 +192,7 @@ dsp/.venv/bin/python dsp/benchmark.py \
 | 20 dB, bypass@15 | 0.982 | −0.007 | −0.7 dB | 687/3751 ACTIVE frames bypassed (identity) — only 18% exceed 15 dB meter on real noise |
 
 Every row is labeled in the JSON output as `real speech (corpus: LibriSpeech
-+ DEMAND (CC-BY 4.0))` — no instance of these numbers can be quoted as the
++ DEMAND (CC BY-SA 3.0))` — no instance of these numbers can be quoted as the
 synthetic or the impaired-hearing result. The bypass cell is deliberately
 mixed: on real kitchen babble the short-time SNR meter stays below 15 dB for
 most frames even at 20 dB input, so bypass helps segSNR but the not-yet-
