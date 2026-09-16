@@ -1,0 +1,10 @@
+[project]
+name = "decibel-dsp"
+version = "0.1.0"
+description = "Decibel Silicon signal-processing research pipeline (noise reduction baseline, power model, latency, benchmarking)"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
