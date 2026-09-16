@@ -248,8 +248,21 @@ class SpectralSubtraction:
         functions of the input stream (reset() -> identical replay).
     """
 
-    def __init__(self, config: SpectralSubtractionConfig | None = None) -> None:
+    def __init__(self, config: SpectralSubtractionConfig | None = None,
+                 gain_hook=None) -> None:
+        """gain_hook: optional callable(mag, noise_mag, frame_index) -> gains.
+
+        When set, it replaces the ENTIRE gain-decision step in ACTIVE frames
+        (alpha map, meters, bypass): the learned model occupies exactly the
+        same interface point the classical logic occupies. Default None keeps
+        this class byte-identical to the classical algorithm (all existing
+        tests and the firmware port depend on that). The hook must accept and
+        return float64 arrays of length n_fft//2+1 and gains in [0,1]; any
+        non-finite or out-of-range result RAISES (fail-closed: no poisoned
+        frame is ever emitted with a clamped plausible number).
+        """
         self.config = config or SpectralSubtractionConfig()
+        self.gain_hook = gain_hook
         cfg = self.config
         # Periodic Hann analysis window (w[0] small but nonzero):
         # sin^2(pi * n / N) for n in 0..N-1.
@@ -288,6 +301,10 @@ class SpectralSubtraction:
         self._active_frames = 0
         self._bypass_count = 0
         self.last_alpha_eff = float(cfg.alpha)
+        # Learned-model hook state is reset with the stream so replay after
+        # reset() is deterministic (the hook's own hidden state is internal).
+        if self.gain_hook is not None and hasattr(self.gain_hook, "reset"):
+            self.gain_hook.reset()
 
     @property
     def state(self) -> str:
@@ -363,112 +380,17 @@ class SpectralSubtraction:
 
         if self._state == STATE_ACTIVE:
             self._active_frames += 1
-            # --- v2 adaptive meters (ACTIVE only) ---------------------------
-            # The VAD/SNR machinery consumes the FINAL noise estimate, so it
-            # cannot run before the flip-frame division; starting it here also
-            # keeps NOISE_EST cost identical to v1.
-            need_meters = cfg.noise_tracking or (
-                cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0
-            ) or (cfg.high_snr_bypass_db is not None)
-            if need_meters:
-                # Smoothed magnitude (for stable energy/SNR meters).
-                if not self._sm_running:
-                    self._sm_mag = mag.copy()
-                    self._sm_running = True
-                else:
-                    self._sm_mag = (
-                        (1.0 - VAD_MAG_SMOOTHING) * self._sm_mag
-                        + VAD_MAG_SMOOTHING * mag
-                    )
-                # eps-guarded energies => ratio floor is finite (-120 dB);
-                # NaN can never reach the VAD/gain path (fail-closed).
-                self._energy_sig = float(np.sum(self._sm_mag ** 2))
-                self._energy_noise = float(np.sum(self._noise_mag ** 2))
-                ratio_db = 10.0 * np.log10(
-                    (self._energy_sig + 1e-12) / (self._energy_noise + 1e-12)
-                )
-
-                # Voice-activity decision with hangover: once VAD triggers,
-                # it stays active for hangover frames so trailing speech
-                # energy cannot leak a speech frame into the noise estimate.
-                if self._vad_hangover > 0:
-                    self._vad_hangover -= 1
-                    vad_active = True
-                else:
-                    vad_active = bool(ratio_db >= cfg.vad_threshold_db)
-                    if vad_active:
-                        self._vad_hangover = cfg.vad_hangover_frames
-
-                # Noise tracking on frames that are BOTH speech-inactive (VAD + hangover)
-                # AND meaningfully quieter than the current estimate. The
-                # downward-only gate is what keeps the tracker from chasing
-                # speech: once the estimate is at the mixture level the frame
-                # ratio is ~0 dB and updates stop (no cascade - see
-                # TRACK_MIN_RATIO_DB). Deterministic: mu fixed.
-                if (cfg.noise_tracking and not vad_active
-                        and ratio_db < TRACK_MIN_RATIO_DB):
-                    self._noise_mag += cfg.noise_update_mu * (mag - self._noise_mag)
-                    self._noise_update_count += 1
-
-                # SNR estimate (smoothed) -> adaptive alpha_eff (and/or the
-                # high-SNR bypass decision). The meter must update whenever
-                # the alpha map OR the bypass needs a read.
-                use_alpha_map = (
-                    cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0
-                )
-                if use_alpha_map or cfg.high_snr_bypass_db is not None:
-                    if self._snr_est_db is None:
-                        self._snr_est_db = float(ratio_db)
-                    else:
-                        self._snr_est_db = (
-                            (1.0 - SNR_EST_SMOOTHING) * self._snr_est_db
-                            + SNR_EST_SMOOTHING * float(ratio_db)
-                        )
-                if use_alpha_map:
-                    # Tent-shaped SNR->alpha map (see module docstring):
-                    # alpha_eff == alpha at snr_ref_db, relaxes toward
-                    # alpha_min on BOTH sides (protects buried speech at low
-                    # SNR and clean signal at high SNR).
-                    alpha_eff = float(np.clip(
-                        cfg.alpha
-                        - cfg.alpha_snr_slope
-                        * abs(self._snr_est_db - cfg.alpha_snr_ref_db),
-                        cfg.alpha_min,
-                        cfg.alpha_max,
-                    ))
-                else:
-                    alpha_eff = float(cfg.alpha)
-                self.last_alpha_eff = alpha_eff
-
-                # Revision 2.1 high-SNR bypass: above the threshold the frame
-                # passes through EXACTLY (gain=1, the verified WOLA identity)
-                # and subtraction is skipped. Fail-closed: if snr_est_db is
-                # somehow still None, the bypass is DENIED -> subtraction.
-                bypass = (
-                    cfg.high_snr_bypass_db is not None
-                    and self._snr_est_db is not None
-                    and self._snr_est_db > cfg.high_snr_bypass_db
-                )
-                if bypass:
-                    self._bypass_count += 1
-                    gain = np.ones(n_bins)
-                else:
-                    # Berouti over-subtraction with spectral floor, alpha_eff.
-                    # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
-                    denom = np.maximum(mag, 1e-12)
-                    gain = np.maximum(
-                        1.0 - alpha_eff * self._noise_mag / denom, cfg.floor
-                    )
+            if self.gain_hook is not None:
+                # Learned-gain path (dsp/learned): the hook occupies exactly
+                # the gain-decision interface point the classical
+                # meters/alpha/bypass logic occupies, and consumes the SAME
+                # per-frame magnitude + the pipeline's OWN noise estimate -
+                # the model sees the same information the classical algorithm
+                # had, and the WOLA chain downstream is identical. Meters and
+                # alpha are not needed: the model is the decision.
+                gain = self._apply_gain_hook(mag)
             else:
-                # v1 static path (identical to baseline behavior).
-                alpha_eff = float(cfg.alpha)
-                self.last_alpha_eff = alpha_eff
-                # Berouti over-subtraction with spectral floor, alpha_eff.
-                # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
-                denom = np.maximum(mag, 1e-12)
-                gain = np.maximum(
-                    1.0 - alpha_eff * self._noise_mag / denom, cfg.floor
-                )
+                gain = self._classical_gain(cfg, mag, n_bins)
             enhanced = gain * spec
         else:
             # NOISE_EST warm-up: passthrough. No subtraction artifact is
@@ -494,6 +416,147 @@ class SpectralSubtraction:
         return out
 
     # -- internals ----------------------------------------------------------
+
+    def _classical_gain(self, cfg, mag: np.ndarray, n_bins: int) -> np.ndarray:
+        """The ENTIRE classical (v1+v2) gain-decision for an ACTIVE frame.
+
+        Extracted verbatim from the pre-learned single code path so the
+        classical behavior is byte-identical whether or not a gain_hook is
+        installed (the learned path never enters here). Mutates meter state
+        (_sm_mag, energies, snr_est, VAD, tracker) and sets last_alpha_eff.
+        """
+        # --- v2 adaptive meters (ACTIVE only) -------------------------------
+        # The VAD/SNR machinery consumes the FINAL noise estimate, so it
+        # cannot run before the flip-frame division; starting it here also
+        # keeps NOISE_EST cost identical to v1.
+        need_meters = cfg.noise_tracking or (
+            cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0
+        ) or (cfg.high_snr_bypass_db is not None)
+        if need_meters:
+            # Smoothed magnitude (for stable energy/SNR meters).
+            if not self._sm_running:
+                self._sm_mag = mag.copy()
+                self._sm_running = True
+            else:
+                self._sm_mag = (
+                    (1.0 - VAD_MAG_SMOOTHING) * self._sm_mag
+                    + VAD_MAG_SMOOTHING * mag
+                )
+            # eps-guarded energies => ratio floor is finite (-120 dB);
+            # NaN can never reach the VAD/gain path (fail-closed).
+            self._energy_sig = float(np.sum(self._sm_mag ** 2))
+            self._energy_noise = float(np.sum(self._noise_mag ** 2))
+            ratio_db = 10.0 * np.log10(
+                (self._energy_sig + 1e-12) / (self._energy_noise + 1e-12)
+            )
+
+            # Voice-activity decision with hangover: once VAD triggers,
+            # it stays active for hangover frames so trailing speech
+            # energy cannot leak a speech frame into the noise estimate.
+            if self._vad_hangover > 0:
+                self._vad_hangover -= 1
+                vad_active = True
+            else:
+                vad_active = bool(ratio_db >= cfg.vad_threshold_db)
+                if vad_active:
+                    self._vad_hangover = cfg.vad_hangover_frames
+
+            # Noise tracking on frames that are BOTH speech-inactive (VAD + hangover)
+            # AND meaningfully quieter than the current estimate. The
+            # downward-only gate is what keeps the tracker from chasing
+            # speech: once the estimate is at the mixture level the frame
+            # ratio is ~0 dB and updates stop (no cascade - see
+            # TRACK_MIN_RATIO_DB). Deterministic: mu fixed.
+            if (cfg.noise_tracking and not vad_active
+                    and ratio_db < TRACK_MIN_RATIO_DB):
+                self._noise_mag += cfg.noise_update_mu * (mag - self._noise_mag)
+                self._noise_update_count += 1
+
+            # SNR estimate (smoothed) -> adaptive alpha_eff (and/or the
+            # high-SNR bypass decision). The meter must update whenever
+            # the alpha map OR the bypass needs a read.
+            use_alpha_map = (
+                cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0
+            )
+            if use_alpha_map or cfg.high_snr_bypass_db is not None:
+                if self._snr_est_db is None:
+                    self._snr_est_db = float(ratio_db)
+                else:
+                    self._snr_est_db = (
+                        (1.0 - SNR_EST_SMOOTHING) * self._snr_est_db
+                        + SNR_EST_SMOOTHING * float(ratio_db)
+                    )
+            if use_alpha_map:
+                # Tent-shaped SNR->alpha map (see module docstring):
+                # alpha_eff == alpha at snr_ref_db, relaxes toward
+                # alpha_min on BOTH sides (protects buried speech at low
+                # SNR and clean signal at high SNR).
+                alpha_eff = float(np.clip(
+                    cfg.alpha
+                    - cfg.alpha_snr_slope
+                    * abs(self._snr_est_db - cfg.alpha_snr_ref_db),
+                    cfg.alpha_min,
+                    cfg.alpha_max,
+                ))
+            else:
+                alpha_eff = float(cfg.alpha)
+            self.last_alpha_eff = alpha_eff
+
+            # Revision 2.1 high-SNR bypass: above the threshold the frame
+            # passes through EXACTLY (gain=1, the verified WOLA identity)
+            # and subtraction is skipped. Fail-closed: if snr_est_db is
+            # somehow still None, the bypass is DENIED -> subtraction.
+            bypass = (
+                cfg.high_snr_bypass_db is not None
+                and self._snr_est_db is not None
+                and self._snr_est_db > cfg.high_snr_bypass_db
+            )
+            if bypass:
+                self._bypass_count += 1
+                gain = np.ones(n_bins)
+            else:
+                # Berouti over-subtraction with spectral floor, alpha_eff.
+                # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
+                denom = np.maximum(mag, 1e-12)
+                gain = np.maximum(
+                    1.0 - alpha_eff * self._noise_mag / denom, cfg.floor
+                )
+        else:
+            # v1 static path (identical to baseline behavior).
+            alpha_eff = float(cfg.alpha)
+            self.last_alpha_eff = alpha_eff
+            # Berouti over-subtraction with spectral floor, alpha_eff.
+            # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
+            denom = np.maximum(mag, 1e-12)
+            gain = np.maximum(
+                1.0 - alpha_eff * self._noise_mag / denom, cfg.floor
+            )
+        return gain
+
+    def _apply_gain_hook(self, mag: np.ndarray) -> np.ndarray:
+        """Run the external gain hook and enforce the fail-closed contract.
+
+        The hook must return per-bin gains in [0,1]; anything non-finite or
+        out of range RAISES (a poisoned frame is never emitted with clamped
+        plausible numbers - the caller surfaces the error instead of a
+        "learned" metric). last_alpha_eff is pinned to its configured value
+        (the learned path does not use alpha; the field stays defined for
+        benchmark introspection).
+        """
+        gains = self.gain_hook(mag, self._noise_mag, self._frame_index)
+        gains = np.asarray(gains, dtype=np.float64)
+        if gains.shape != (self.config.n_fft // 2 + 1,):
+            raise ValueError(
+                f"gain hook returned shape {gains.shape}, expected "
+                f"{(self.config.n_fft // 2 + 1,)}")
+        if not np.isfinite(gains).all():
+            raise ValueError("gain hook returned non-finite gains; refusing frame")
+        if bool((gains < -1e-6).any()) or bool((gains > 1 + 1e-6).any()):
+            raise ValueError(
+                f"gain hook returned gains outside [0,1]: "
+                f"min={gains.min():.4f} max={gains.max():.4f}")
+        self.last_alpha_eff = float(self.config.alpha)
+        return np.clip(gains, 0.0, 1.0)
 
     def _compute_inv_coverage(self) -> np.ndarray:
         """Per-position inverse window-power coverage, period H.

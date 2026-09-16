@@ -311,3 +311,55 @@ def estimate_power_mw(n_fft: int, hop: int, fs: int, *,
         frames_per_second=float(frames_per_second),
         effective_mhz=cycles_per_second / 1e6,
     )
+
+
+def estimate_learned_power_mw(n_fft: int, hop: int, fs: int, *,
+                              gru_features: int = 48, gru_hidden: int = 32,
+                              gru_bands: int = 24,
+                              gru_cycles_per_mac: float = 5.0,
+                              cycle_table: CycleTable | None = None,
+                              noise_est: bool = False,
+                              subtract: bool = False,
+                              tracking: bool = False,
+                              adaptive: bool = False,
+                              bypass: bool = False) -> PowerEstimate:
+    """Learned-gain combined power estimate: classical chain + GRU decision.
+
+    The learned model (dsp/learned) REPLACES the classical gain decision, so
+    the classical part is modeled with subtract=False (the Berouti div/mul/add
+    alpha path is not executed); window/FFT/magnitude/noise-est/reconstruct/
+    OLA all remain, and the GRU + readout MACs are added on top:
+
+        macs/frame = 3 * (F*H + H*H)          # r, z, n gates (input + hidden)
+                   + B*H                       # linear readout to B gains
+        cycles/mac ~= 5 (mul 4c + add 1c, RV32IMC in-order, no MAC instruction)
+
+    A PULP dotp lever would cut MAC cycles toward 1-2 (the micro-architectural
+    change we would make BEFORE firmware work; the 5c/mac figure is the
+    conservative plain-CV32E40P number). Like the classical estimate this is a
+    MODEL, not measured silicon - it always carries the PowerEstimate caveat.
+    """
+    classical = estimate_power_mw(n_fft, hop, fs, cycle_table=cycle_table,
+                                  noise_est=noise_est, subtract=subtract,
+                                  tracking=tracking, adaptive=adaptive,
+                                  bypass=bypass)
+    macs = (3 * (gru_features * gru_hidden + gru_hidden * gru_hidden)
+            + gru_bands * gru_hidden)
+    cycles = classical.cycles_per_frame + macs * gru_cycles_per_mac
+    frames_per_second = fs / hop
+    cycles_per_second = cycles * frames_per_second
+    power_mw = cycles_per_second / (CV32E40P_MOPS_PER_MW * 1e6)
+    return PowerEstimate(
+        power_mw=power_mw,
+        cycles_per_frame=float(cycles),
+        frames_per_second=float(frames_per_second),
+        effective_mhz=cycles_per_second / 1e6,
+        caveat=(
+            "MODEL ESTIMATE, not measured on silicon. Classical chain cost "
+            "(minus the replaced gain decision) + single-GRU decision cost at "
+            "5 cycles/MAC on RV32IMC (mul 4c + add 1c, in-order, no MAC "
+            "instruction). Excludes memory, leakage, clock tree, I/O. A PULP "
+            "dotp (1-2 cycles/MAC) would cut the GRU share by ~3x. See "
+            "docs/research/power-model.md and docs/research/learned-model.md."
+        ),
+    )

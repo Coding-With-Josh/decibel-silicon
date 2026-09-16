@@ -116,6 +116,7 @@ class NoiseReductionPipeline:
         self,
         *,
         config: SpectralSubtractionConfig | None = None,
+        gain_hook=None,
         ceiling_ms: float = DEFAULT_CEILING_MS,
         preferred_ms: float = DEFAULT_PREFERRED_MS,
     ) -> None:
@@ -126,7 +127,9 @@ class NoiseReductionPipeline:
             raise ValueError("ceiling_ms must be >= preferred_ms")
         self.ceiling_ms = float(ceiling_ms)
         self.preferred_ms = float(preferred_ms)
-        self._ss = SpectralSubtraction(self.config)
+        # Learned-model bridge (dsp/learned): same interface point as the
+        # classical gain decision; None keeps the pipeline byte-identical.
+        self._ss = SpectralSubtraction(self.config, gain_hook=gain_hook)
         self._frame_results: list[FrameResult] = []
         self._measured_delay_ms: float | None = None
         self.reset()
