@@ -36,9 +36,18 @@ Algorithm per frame (WOLA filter-bank, N=128 @ 16 kHz, hop=64):
       bins where |X| ~ 2N (STOI collapse; measured 0 dB STOI 0.230->0.147),
       and at high SNR over-subtraction creates musical-noise artifacts (the
       canonical Berouti SNR->alpha map also decreases alpha as SNR rises).
-      Identity-test modes are bypassed explicitly: if alpha <= 0 or floor >= 1
-      the gain is forced to 1.0 and no adaptive mapping runs.
-  5. Apply the real gain to the complex spectrum (no atan2); 6. IFFT;
+Identity-test modes are bypassed explicitly: if alpha <= 0 or floor >= 1
+       the gain is forced to 1.0 and no adaptive mapping runs.
+    4.5. Revision 2.1 high-SNR bypass (IF high_snr_bypass_db is set): once the
+       smoothed SNR meter strictly exceeds the threshold, the frame passes
+       through EXACTLY (gain=1 -> the verified WOLA identity) and subtraction
+       never runs. This is the measured fix for the residual high-SNR loss of
+       revision 2 (20 dB segSNR was still -2.6 dB under subtraction): clean-ish
+       input can no longer be damaged. The decision uses the SAME meter as the
+       alpha map, so the meters run whenever adaptive_alpha OR the bypass is
+       active; the fail-closed default is to keep subtracting when the meter
+       cannot decide (snr_est_db is None).
+   5. Apply the real gain to the complex spectrum (no atan2); 6. IFFT;
   7. synthesis window + overlap-add with coverage normalization (WOLA
      identity holds exactly for gain=1: verified by tests).
 
@@ -84,6 +93,18 @@ DEFAULT_ALPHA_SNR_REF_DB = 10.0   # snr_est at which alpha_eff == alpha
 DEFAULT_ALPHA_SNR_SLOPE = 0.1     # tent half-slope: alpha_eff per dB away from ref
 DEFAULT_ALPHA_MIN = 1.0           # alpha_eff floor (protects speech at 0 dB)
 DEFAULT_ALPHA_MAX = 3.0           # alpha_eff ceiling (validation dome)
+# High-SNR bypass (revision 2.1). Default OFF. When set, every ACTIVE frame
+# whose smoothed SNR estimate strictly exceeds the threshold passes through
+# with gain=1 (the exact WOLA identity) and skips subtraction entirely. This
+# is the measured fix for the residual high-SNR loss of revision 2 (20 dB:
+# delta segSNR -2.6 dB under subtraction from over-subtraction of
+# inter-harmonic speech energy): clean-ish input is passed through unmodified
+# instead of being damaged. The decision uses the SAME smoothed snr_est_db
+# meter as the alpha map (no second estimator), so the meter must run even
+# when adaptive_alpha is off - handled by need_meters below. Validation
+# demands None or a finite value > 0 dB; values <= 0 would bypass on
+# near-silence and are rejected. Operating range: >= 10 dB (docs).
+DEFAULT_HIGH_SNR_BYPASS_DB = None   # e.g. 15.0 = bypass above 15 dB SNR
 
 # Internal smoothing constants (documented, deliberately not config):
 VAD_MAG_SMOOTHING = 0.2    # per-bin magnitude smoothing for the VAD/SNR meter
@@ -127,6 +148,7 @@ class SpectralSubtractionConfig:
     alpha_snr_slope: float = DEFAULT_ALPHA_SNR_SLOPE
     alpha_min: float = DEFAULT_ALPHA_MIN
     alpha_max: float = DEFAULT_ALPHA_MAX
+    high_snr_bypass_db: float | None = DEFAULT_HIGH_SNR_BYPASS_DB
 
     def __post_init__(self) -> None:
         if not isinstance(self.fs, int) or self.fs <= 0:
@@ -200,6 +222,16 @@ class SpectralSubtractionConfig:
                 f"need 0 <= alpha_min <= alpha_max <= 10, got "
                 f"alpha_min={self.alpha_min}, alpha_max={self.alpha_max}"
             )
+        # High-SNR bypass: None (off) or a FINITE threshold > 0 dB. A value
+        # <= 0 would classify near-silence as "clean" and pass noise through
+        # (quality fail-open) - rejected. NaN/Inf would poison the comparison.
+        if self.high_snr_bypass_db is not None:
+            if (not np.isfinite(self.high_snr_bypass_db)
+                    or self.high_snr_bypass_db <= 0.0):
+                raise ValueError(
+                    "high_snr_bypass_db must be None or a finite float > 0 "
+                    f"(dB), got {self.high_snr_bypass_db!r}"
+                )
 
 
 class SpectralSubtraction:
@@ -253,6 +285,8 @@ class SpectralSubtraction:
         self._snr_est_db: float | None = None
         self._vad_hangover = 0
         self._noise_update_count = 0
+        self._active_frames = 0
+        self._bypass_count = 0
         self.last_alpha_eff = float(cfg.alpha)
 
     @property
@@ -273,6 +307,17 @@ class SpectralSubtraction:
     def noise_update_count(self) -> int:
         """Number of ACTIVE frames on which noise tracking updated the estimate."""
         return self._noise_update_count
+
+    @property
+    def active_frames(self) -> int:
+        """Number of frames processed in ACTIVE state."""
+        return self._active_frames
+
+    @property
+    def bypass_count(self) -> int:
+        """Number of ACTIVE frames emitted on the high-SNR bypass (identity)
+        path. Zero when high_snr_bypass_db is disabled."""
+        return self._bypass_count
 
     def process_frame(self, new_samples: np.ndarray) -> np.ndarray:
         """Consume `hop` new samples; return `hop` processed output samples."""
@@ -317,13 +362,14 @@ class SpectralSubtraction:
                 self._state = STATE_ACTIVE
 
         if self._state == STATE_ACTIVE:
+            self._active_frames += 1
             # --- v2 adaptive meters (ACTIVE only) ---------------------------
             # The VAD/SNR machinery consumes the FINAL noise estimate, so it
             # cannot run before the flip-frame division; starting it here also
             # keeps NOISE_EST cost identical to v1.
             need_meters = cfg.noise_tracking or (
                 cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0
-            )
+            ) or (cfg.high_snr_bypass_db is not None)
             if need_meters:
                 # Smoothed magnitude (for stable energy/SNR meters).
                 if not self._sm_running:
@@ -364,8 +410,13 @@ class SpectralSubtraction:
                     self._noise_mag += cfg.noise_update_mu * (mag - self._noise_mag)
                     self._noise_update_count += 1
 
-                # SNR estimate (smoothed) -> adaptive alpha_eff.
-                if (cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0):
+                # SNR estimate (smoothed) -> adaptive alpha_eff (and/or the
+                # high-SNR bypass decision). The meter must update whenever
+                # the alpha map OR the bypass needs a read.
+                use_alpha_map = (
+                    cfg.adaptive_alpha and cfg.alpha > 0.0 and cfg.floor < 1.0
+                )
+                if use_alpha_map or cfg.high_snr_bypass_db is not None:
                     if self._snr_est_db is None:
                         self._snr_est_db = float(ratio_db)
                     else:
@@ -373,6 +424,7 @@ class SpectralSubtraction:
                             (1.0 - SNR_EST_SMOOTHING) * self._snr_est_db
                             + SNR_EST_SMOOTHING * float(ratio_db)
                         )
+                if use_alpha_map:
                     # Tent-shaped SNR->alpha map (see module docstring):
                     # alpha_eff == alpha at snr_ref_db, relaxes toward
                     # alpha_min on BOTH sides (protects buried speech at low
@@ -387,15 +439,36 @@ class SpectralSubtraction:
                 else:
                     alpha_eff = float(cfg.alpha)
                 self.last_alpha_eff = alpha_eff
+
+                # Revision 2.1 high-SNR bypass: above the threshold the frame
+                # passes through EXACTLY (gain=1, the verified WOLA identity)
+                # and subtraction is skipped. Fail-closed: if snr_est_db is
+                # somehow still None, the bypass is DENIED -> subtraction.
+                bypass = (
+                    cfg.high_snr_bypass_db is not None
+                    and self._snr_est_db is not None
+                    and self._snr_est_db > cfg.high_snr_bypass_db
+                )
+                if bypass:
+                    self._bypass_count += 1
+                    gain = np.ones(n_bins)
+                else:
+                    # Berouti over-subtraction with spectral floor, alpha_eff.
+                    # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
+                    denom = np.maximum(mag, 1e-12)
+                    gain = np.maximum(
+                        1.0 - alpha_eff * self._noise_mag / denom, cfg.floor
+                    )
             else:
                 # v1 static path (identical to baseline behavior).
                 alpha_eff = float(cfg.alpha)
                 self.last_alpha_eff = alpha_eff
-
-            # Berouti over-subtraction with spectral floor, alpha_eff.
-            # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
-            denom = np.maximum(mag, 1e-12)
-            gain = np.maximum(1.0 - alpha_eff * self._noise_mag / denom, cfg.floor)
+                # Berouti over-subtraction with spectral floor, alpha_eff.
+                # gain[k] = max(1 - alpha_eff * N[k] / max(|X[k]|, eps), floor)
+                denom = np.maximum(mag, 1e-12)
+                gain = np.maximum(
+                    1.0 - alpha_eff * self._noise_mag / denom, cfg.floor
+                )
             enhanced = gain * spec
         else:
             # NOISE_EST warm-up: passthrough. No subtraction artifact is

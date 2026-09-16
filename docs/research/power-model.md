@@ -31,7 +31,10 @@
    interpolation (~35 cycles, assumed until cycle-accurate profiling). Total
    **15 288 cycles/frame** for the v1 static path (asserted by
    `power_model.py`); the v2 default adds **1 278** (adaptive meters + tent
-   map) → **16 566**; enabling tracking adds 390 more → **16 956**. The
+   map) → **16 566**; enabling tracking adds 390 more → **16 956**. A
+   revision 2.1 bypassed ACTIVE frame (high-SNR identity) keeps the meters +
+   SNR log2 for the DECISION but skips subtraction + alpha map → **15 258**.
+   The
    ported loops in `firmware/` stay within the same op classes (the device
    is still the v1 static port this pass; see `noise-reduction.md`).
 
@@ -43,8 +46,11 @@
      (v2 + tracking).
    - µW/MHz: Gautschi et al. report 193 MOPS/mW at 40 MHz / 1 mW (28 nm
      FD-SOI near-threshold, CV32E40P-class core) → 5.18 µW/MHz nominal.
-   - **v1: 19.80 µW. v2 default: 21.46 µW. v2 + tracking: 21.96 µW** =
-     effective-MHz × 5.18.
+   - **v1: 19.80 µW. v2 default: 21.46 µW. v2 + tracking: 21.96 µW.
+     v2 bypassed ACTIVE frame (revision 2.1): 19.76 µW** =
+     effective-MHz × 5.18. A stream that mixes bypassed and non-bypassed
+     frames draws between the two v2 values; the benchmark prints the
+     worst case, the bypass case, and the measured bypassed/ACTIVE counts.
 
 3. **Cross-check** — the 65 nm range from the same paper (12.26–33.8
    µW/MHz at 1.08 V): 4.142 × [12.26, 33.8] = **[50.8, 140.0] µW** (v2

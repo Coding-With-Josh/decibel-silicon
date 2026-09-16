@@ -143,6 +143,18 @@ class NoiseReductionPipeline:
         return self._ss.state
 
     @property
+    def bypass_count(self) -> int:
+        """ACTIVE frames emitted on the high-SNR identity path (revision 2.1);
+        zero when the bypass is disabled."""
+        return self._ss.bypass_count
+
+    @property
+    def active_frames(self) -> int:
+        """Frames processed in ACTIVE state (the denominator for bypass_count
+        when reporting the bypassed fraction)."""
+        return self._ss.active_frames
+
+    @property
     def frame_budget_ms(self) -> float:
         return self.config.hop / self.config.fs * 1000.0
 

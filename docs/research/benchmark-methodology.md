@@ -131,3 +131,35 @@ Default adaptive config: 16,566 cycles/frame (15,288 + 1,278 adaptive) →
 21.46 µW at the cited operating point (+8.4%). With tracking enabled: 16,956
 → 21.96 µW. Latency unchanged: 4.00 ms measured, 635/635 frames under the
 20 ms ceiling.
+
+# Revision 2.1: high-SNR bypass (`--high-snr-bypass-db`)
+
+Default OFF. When set, ACTIVE frames whose smoothed SNR meter strictly
+exceeds the threshold pass through EXACTLY (gain=1 → verified WOLA identity);
+subtraction and the alpha map are skipped (decision uses the same meter as
+the alpha map). Measured on the same synthetic signal, threshold 15 dB:
+
+| SNR | bypassed/ACTIVE | ΔSTOI | ΔsegSNR | notes |
+|---|---|---|---|---|
+| 0 dB | 0/627 | −0.055 | −3.2 dB | meter never reaches 15 dB → inert (identical to default) |
+| 10 dB | 247/627 | +0.004 | −2.8 dB | partial; identity frames can't be damaged |
+| 15 dB | 620/627 | +0.000 | −0.0 dB | high-SNR gap CLOSED |
+| 20 dB | 622/627 | +0.000 | −0.0 dB | high-SNR gap CLOSED |
+
+Reproduce: `dsp/.venv/bin/python dsp/benchmark.py --snr-db 20
+--high-snr-bypass-db 15 --json /tmp/bypass20.json`.
+
+**Reading the numbers:** the high-SNR residual loss of revision 2 (20 dB
+segSNR −2.6 dB from over-subtraction of inter-harmonic speech energy) is now
+fully closed wherever the meter reads ≥ 15 dB — the algorithm stops processing
+clean-ish frames instead of damaging them. Low-SNR cells (−5…5 dB) are
+unchanged: the bypass never fires there, so the 0 dB STOI gap stays
+PARTIALLY closed (honest label: still partial, never claimed fixed).
+
+## Cost (model, not a measurement) — bypass frame
+
+A bypassed ACTIVE frame keeps the meters + SNR log2 (the decision needs them)
+but skips subtraction + alpha map: 15,258 cycles → 19.76 µW per frame (vs
+16,566 / 21.46 µW all-subtract). A real stream mixes both, so the benchmark
+prints the worst case, the bypass case, AND the measured bypassed/ACTIVE
+counts — never one disguised number.

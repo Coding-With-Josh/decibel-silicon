@@ -151,12 +151,12 @@ WOLA identity is preserved exactly (tests).
 | 20 dB ΔsegSNR | −5.3 dB @α2 | **−2.6 dB** | matches v1 α=1 best |
 
 **Honest verdict:** the revision partially closes the 0 dB gap (STOI loss
-−0.083 → −0.055; segSNR −4.0 → −3.2) and fully closes the high-SNR gap
-(20 dB now matches the best measured v1 cell at α=1). The low-SNR STOI dip
-**remains negative** — the algorithm still damages intelligibility where the
-noise is loud. Closing it further (Wiener/MMSE gains, per-band modulation,
-or a DNN stage) is beyond this pass and is documented as future work, not
-claimed.
+−0.083 → −0.055; segSNR −4.0 → −3.2). The **residual high-SNR loss is closed
+by revision 2.1 below** (20 dB segSNR −2.6 dB → −0.0 dB). The low-SNR STOI
+dip **remains negative** — the algorithm still damages intelligibility where
+the noise is loud. Closing it further (Wiener/MMSE gains, per-band
+modulation, or a DNN stage) is beyond this pass and is documented as future
+work, not claimed.
 
 ## Cost of the revision (model, not silicon)
 
@@ -164,6 +164,30 @@ Adaptive meters + tent map: +1,278 cycles/frame (15,288 → 16,566) → 21.46 µ
 at the cited operating point (+8.4% over the v1 19.80 µW). Tracking (when
 enabled) adds 390 more → 21.96 µW. See `power-model.md`. Latency unchanged:
 4.00 ms measured (the meters run inside the ACTIVE frame; no added buffering).
+
+## Revision 2.1 — high-SNR bypass (default OFF; `high_snr_bypass_db`)
+
+The tent map relaxed α at high SNR but subtraction still ran (20 dB ΔsegSNR
+was −2.6 dB — over-subtraction of inter-harmonic speech energy). The fix is
+not to tune α again but to **stop processing clean-ish frames entirely**: once
+the smoothed SNR meter (the same `snr_est_db` the alpha map uses — no second
+estimator) strictly exceeds `high_snr_bypass_db`, the frame passes through
+EXACTLY — gain=1 through the verified WOLA identity — and the subtraction
+arithmetic and alpha map never run.
+
+- Decision is per-frame and idempotent; fail-closed: if the meter cannot
+  decide (`snr_est_db` is None) the bypass is DENIED → subtraction.
+- Validation: `None` (off) or finite `> 0` dB; `≤ 0` would classify
+  near-silence as clean and is rejected. Operating range: ≥ 10 dB.
+- Measured on the benchmark (threshold 15 dB): **0 dB → 0/627 frames
+  bypassed (inert), 10 dB → 247/627 (+0.004 ΔSTOI), 15 dB → 620/627
+  (ΔSTOI +0.000, ΔsegSNR −0.0 dB), 20 dB → 622/627 (−0.0 dB)**. The
+  high-SNR gap is now FULLY closed at the cells where the meter reads ≥ 15 dB;
+  low-SNR cells are unchanged (partial closure stands).
+- Power (model): a bypassed frame skips subtraction + alpha map → 15,258
+  cycles → 19.76 µW per frame; a stream that mixes bypassed and active frames
+  draws between the two — the benchmark prints worst-case, bypass-case, and
+  the measured bypassed/ACTIVE counts.
 
 ## References
 

@@ -47,6 +47,7 @@ from src.spectral_subtraction import (
     DEFAULT_ALPHA_SNR_SLOPE,
     DEFAULT_FLOOR,
     DEFAULT_FS,
+    DEFAULT_HIGH_SNR_BYPASS_DB,
     DEFAULT_HOP,
     DEFAULT_N_FFT,
     DEFAULT_NOISE_FRAMES,
@@ -301,6 +302,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         alpha_snr_slope=args.alpha_snr_slope,
         alpha_min=args.alpha_min,
         alpha_max=args.alpha_max,
+        high_snr_bypass_db=args.high_snr_bypass_db,
     )
     pipeline = NoiseReductionPipeline(
         config=cfg, ceiling_ms=args.ceiling_ms, preferred_ms=args.preferred_ms,
@@ -327,6 +329,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
             alpha_snr_slope=args.alpha_snr_slope,
             alpha_min=args.alpha_min,
             alpha_max=args.alpha_max,
+            high_snr_bypass_db=args.high_snr_bypass_db,
         )
         pipeline = NoiseReductionPipeline(
             config=cfg, ceiling_ms=args.ceiling_ms, preferred_ms=args.preferred_ms,
@@ -396,6 +399,19 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         "crosscheck_uW_per_MHz_range": list(est.crosscheck_uW_per_MHz_range),
         "caveat": est.caveat,
     }
+    if cfg.high_snr_bypass_db is not None:
+        # Revision 2.1: report BOTH the all-subtract worst case (headline,
+        # unchanged) and the per-frame cost when a frame IS bypassed, plus the
+        # actually-bypassed fraction of ACTIVE frames measured in the replayed
+        # run - never one disguised number (Phase 2 power-claim honesty).
+        est_byp = estimate_power_mw(cfg.n_fft, cfg.hop, cfg.fs,
+                                    tracking=cfg.noise_tracking,
+                                    adaptive=cfg.adaptive_alpha,
+                                    bypass=True)
+        power["bypass_value_mw"] = est_byp.power_mw
+        power["bypass_cycles_per_frame"] = est_byp.cycles_per_frame
+        power["bypassed_frames"] = pipeline.bypass_count
+        power["active_frames"] = pipeline.active_frames
 
     config_dict = {
         "fs": cfg.fs, "n_fft": cfg.n_fft, "hop": cfg.hop,
@@ -410,6 +426,7 @@ def run_benchmark(args: argparse.Namespace) -> BenchmarkResult:
         "alpha_snr_slope": cfg.alpha_snr_slope,
         "alpha_min": cfg.alpha_min,
         "alpha_max": cfg.alpha_max,
+        "high_snr_bypass_db": cfg.high_snr_bypass_db,
         "noise_leader_blocks": cfg.noise_frames + 1,
         "ceiling_ms": pipeline.ceiling_ms,
         "preferred_ms": pipeline.preferred_ms,
@@ -455,6 +472,17 @@ def render_report(res: BenchmarkResult) -> str:
                  f"cited range) = "
                  f"{res.power['effective_mhz'] * res.power['crosscheck_uW_per_MHz_range'][0]:.3f}.."
                  f"{res.power['effective_mhz'] * res.power['crosscheck_uW_per_MHz_range'][1]:.3f} uW")
+    if "bypass_value_mw" in res.power:
+        lines.append("  high-SNR bypass (revision 2.1):")
+        lines.append(f"    threshold        : {res.config['high_snr_bypass_db']:.1f} dB")
+        lines.append(f"    bypassed frames  : {res.power['bypassed_frames']}/"
+                     f"{res.power['active_frames']} ACTIVE (identity output)")
+        lines.append(f"    per-frame when bypassed: "
+                     f"{res.power['bypass_cycles_per_frame']:.0f} cycles -> "
+                     f"{res.power['bypass_value_mw'] * 1000.0:.2f} uW "
+                     f"(subtraction + alpha map skipped; meters + log2 kept)")
+        lines.append("    NOTE: the stream draws between the two values; the "
+                     "headline is the all-subtract worst case.")
     lines.append(f"  caveat     : {res.power['caveat']}")
     lines.append("-" * 64)
     lat = res.latency
@@ -492,6 +520,10 @@ def render_report(res: BenchmarkResult) -> str:
     lines.append("  alpha_snr_slope=0) and its honest finding remains recorded in")
     lines.append("  the docs. Whether the numbers above improve on v1 is the")
     lines.append("  sweep comparison in docs/research/benchmark-methodology.md.")
+    if res.config.get("high_snr_bypass_db"):
+        lines.append("  High-SNR bypass is ENABLED: frames above the threshold pass")
+        lines.append("  through with gain=1 (exact identity), closing the residual")
+        lines.append("  high-SNR segSNR loss (revision 2.1).")
     lines.append(f"  caveat     : {res.signal_note}")
     lines.append("=" * 64)
     return "\n".join(lines)
@@ -534,6 +566,11 @@ def main(argv: list[str] | None = None) -> int:
                         default=DEFAULT_ALPHA_SNR_SLOPE)
     parser.add_argument("--alpha-min", type=float, default=DEFAULT_ALPHA_MIN)
     parser.add_argument("--alpha-max", type=float, default=DEFAULT_ALPHA_MAX)
+    parser.add_argument(
+        "--high-snr-bypass-db", type=float, default=DEFAULT_HIGH_SNR_BYPASS_DB,
+        help="revision 2.1: pass ACTIVE frames whose SNR meter exceeds this "
+             "threshold through EXACTLY (gain=1, WOLA identity) and skip "
+             "subtraction. None/disabled by default; recommended >= 10 dB.")
     parser.add_argument("--ceiling-ms", type=_positive_float,
                         default=DEFAULT_CEILING_MS)
     parser.add_argument("--preferred-ms", type=_positive_float,

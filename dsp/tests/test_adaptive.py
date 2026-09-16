@@ -296,3 +296,106 @@ def test_all_zero_stream_stays_finite_and_empty_estimate():
     assert np.isfinite(ss.last_alpha_eff)
     assert float(np.sum(ss.noise_magnitude**2)) == 0.0
     assert ss.noise_update_count == 0  # nothing quieter than the estimate
+
+
+# --------------------------------------------------------------------------
+# Revision 2.1: high-SNR bypass (identity above threshold)
+# --------------------------------------------------------------------------
+
+
+def test_high_snr_bypass_identity_above_threshold():
+    """At 20 dB global SNR with threshold 10 dB, virtually every ACTIVE frame
+    reads above the threshold: subtraction is skipped and the stream comes
+    back EXACTLY (the verified WOLA identity). This is the fix for the
+    residual 20 dB segSNR loss. The tone's final frames (energy decays toward
+    zero) legitimately read BELOW the threshold and subtract - the identity
+    assertion is restricted to the interior where bypass is in force."""
+    cfg = SpectralSubtractionConfig(noise_frames=8,
+                                    high_snr_bypass_db=10.0)
+    ss = SpectralSubtraction(cfg)
+    stream = build_stream(cfg, 20.0, seed=60)
+    out = run(ss, stream)
+    assert ss.state == STATE_ACTIVE
+    assert ss.active_frames > 0
+    assert ss.bypass_count > 0
+    # Allow the end-of-tone frames (energy falls below the threshold there);
+    # the mechanism claim is "overwhelmingly bypassed while the tone is loud".
+    assert ss.bypass_count >= ss.active_frames - 8, (
+        f"expected ~all ACTIVE frames to bypass at 20 dB / thresh 10, "
+        f"got bypass={ss.bypass_count} active={ss.active_frames}")
+    # Identity on the interior AFTER the meter converges (the first ~3 ACTIVE
+    # frames read the windowed leader/mixture blend, legitimately subtract
+    # during warm-up, and are excluded): out[j] == in[j - hop] wherever
+    # gain == 1. The window stays well inside the strong-tone region.
+    w = 12000
+    start = (cfg.noise_frames + 6) * cfg.hop   # ~6 frames after ACTIVE starts
+    assert np.allclose(out[start : start + w],
+                       stream[start - cfg.hop : start - cfg.hop + w],
+                       atol=1e-5)
+
+
+def test_high_snr_bypass_not_fired_at_low_snr():
+    """At 0 dB global SNR the meter never reaches the 15 dB threshold:
+    the bypass must NOT fire and subtraction keeps running (output differs
+    from identity). This pins the fail-safe direction: bypass is a quality
+    decision, and a noisy frame must never pass through unprocessed."""
+    cfg = SpectralSubtractionConfig(noise_frames=8,
+                                    high_snr_bypass_db=15.0)
+    ss = SpectralSubtraction(cfg)
+    stream = build_stream(cfg, 0.0, seed=61)
+    out = run(ss, stream)
+    assert ss.bypass_count == 0, f"expected no bypass at 0 dB, got {ss.bypass_count}"
+    assert ss.active_frames > 0
+    # Subtraction must have actually processed the speech region.
+    assert not np.allclose(out[cfg.n_fft + cfg.hop :],
+                           stream[cfg.n_fft : -cfg.hop], atol=1e-3)
+
+
+def test_bypass_threshold_honored_no_hysteresis():
+    """A threshold ABOVE the meter (20 dB stream, 40 dB threshold) never
+    fires: the decision is a strict comparison on the smoothed estimate, no
+    default-bypass, no hysteresis."""
+    cfg = SpectralSubtractionConfig(noise_frames=8,
+                                    high_snr_bypass_db=40.0)
+    ss = SpectralSubtraction(cfg)
+    stream = build_stream(cfg, 20.0, seed=62)
+    run(ss, stream)
+    assert ss.bypass_count == 0
+
+
+def test_bypass_disabled_by_default():
+    """high_snr_bypass_db=None (default) -> the decision path never runs;
+    the counter stays zero even on a clean 20 dB stream."""
+    cfg = SpectralSubtractionConfig()  # defaults: bypass None
+    ss = SpectralSubtraction(cfg)
+    stream = build_stream(cfg, 20.0, seed=63)
+    run(ss, stream)
+    assert ss.active_frames > 0
+    assert ss.bypass_count == 0
+
+
+def test_bypass_invalid_config_rejected():
+    """Fail-closed config validation: the threshold must be None or a finite
+    value > 0 dB. <= 0 would classify near-silence as clean (quality open),
+    NaN/Inf would poison the comparison."""
+    for bad in (-5.0, 0.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            SpectralSubtractionConfig(high_snr_bypass_db=bad)
+    # The valid sentinel still works alongside defaults.
+    assert SpectralSubtractionConfig(
+        high_snr_bypass_db=12.0).high_snr_bypass_db == 12.0
+
+
+def test_all_zero_stream_with_bypass_fail_closed():
+    """All-zero stream + bypass enabled: the eps-guarded meter reads ~0 dB,
+    far below any sane threshold -> no bypass (silence must not be classified
+    as clean), output stays finite, counter stays zero."""
+    cfg = SpectralSubtractionConfig(noise_tracking=True,
+                                    high_snr_bypass_db=15.0)
+    ss = SpectralSubtraction(cfg)
+    n = cfg.n_fft * 6
+    stream = np.zeros(n)
+    out = run(ss, stream)
+    assert np.isfinite(out).all()
+    assert np.isfinite(ss.last_alpha_eff)
+    assert ss.bypass_count == 0

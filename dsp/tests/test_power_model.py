@@ -164,3 +164,55 @@ def test_log2_cycle_cost_from_table():
                                                    add=1, log2=1))
     m2 = ops_per_frame(128, 64, tracking=False, adaptive=True)
     assert est.cycles_per_frame == pytest.approx(m2.total_operations())
+
+
+# --------------------------------------------------------------------------
+# Revision 2.1: high-SNR bypass frame manifest
+# --------------------------------------------------------------------------
+
+
+def test_bypass_frame_skips_subtraction_and_alpha_map():
+    """A bypassed ACTIVE frame pins gain=1: the subtraction arithmetic and
+    the alpha map are skipped, but the meters AND the SNR log2 still run
+    (the decision needs them), and the reconstruction multiply still runs
+    (gain * spectrum executes even with gain=1)."""
+    active = ops_per_frame(128, 64, adaptive=True)
+    byp = ops_per_frame(128, 64, adaptive=True, bypass=True)
+    assert byp.subtract_mults == 0
+    assert byp.subtract_divs == 0
+    assert byp.subtract_adds == 0
+    assert byp.alpha_ops == 0
+    assert byp.snr_logs == 1          # decision still needs the log2
+    assert byp.smooth_mults > 0       # meters still run
+    assert byp.reconstruct_mults == active.reconstruct_mults
+
+
+def test_bypass_without_adaptive_still_reads_snr():
+    """Bypass can be enabled with adaptive_alpha off (the meter exists only
+    for the decision); the log2 must still be counted and the alpha map
+    must not."""
+    m = ops_per_frame(128, 64, adaptive=False, bypass=True)
+    assert m.snr_logs == 1
+    assert m.alpha_ops == 0
+    assert m.smooth_mults > 0
+
+
+def test_bypass_power_pinned():
+    """The bypass frame saves exactly the subtraction arithmetic and the
+    alpha map (2 mul + 1 div + 2 add per bin, plus the 8 alpha-map ops) - a
+    pinned model formula, not an eyeballed delta."""
+    active = estimate_power_mw(128, 64, 16000, adaptive=True)
+    byp = estimate_power_mw(128, 64, 16000, adaptive=True, bypass=True)
+    bins = 128 // 2 + 1
+    saved = (2 * bins) * 4 + bins * 10 + (2 * bins) * 1 + 8
+    assert active.cycles_per_frame - byp.cycles_per_frame == saved
+    assert byp.cycles_per_frame < active.cycles_per_frame
+    assert byp.power_mw < active.power_mw
+
+
+def test_bypass_disabled_flag_is_noop():
+    """bypass=False (default) must leave the v1/v2 manifests byte-identical
+    (the flag only exists for bypass-active frames)."""
+    a = ops_per_frame(128, 64, tracking=True, adaptive=True, bypass=False)
+    b = ops_per_frame(128, 64, tracking=True, adaptive=True)
+    assert a.total_operations() == b.total_operations()

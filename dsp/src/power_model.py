@@ -98,6 +98,11 @@ smooth_mults     : bins x 4 (sm blend 2 mul + energy sqrs 2 mul)
         smooth_adds      : bins x 3 (sm blend 1 add + energy sums 2 add)
         noise tracking   : bins x (1 mul + 2 add) on inactive frames
         SNR estimate     : 1 fixed-point log2 + linear alpha map (~8 ops)
+    revision 2.1 high-SNR bypass (bypass=True): a bypassed ACTIVE frame
+        keeps the meters + the SNR log2 (the DECISION needs them) but skips
+        the subtraction arithmetic and the alpha map (gain is pinned to 1.0):
+        subtract_* and alpha_ops are zeroed. The reconstruction multiply
+        (gain * spectrum) still runs in the implementation, so it is counted.
 
     These counts are assumptions tied to the algorithm as implemented. If the
     algorithm changes, this model changes with it (never silently).
@@ -152,15 +157,18 @@ smooth_mults     : bins x 4 (sm blend 2 mul + energy sqrs 2 mul)
 
 def ops_per_frame(n_fft: int, hop: int, *, noise_est: bool = False,
                   subtract: bool = True, tracking: bool = False,
-                  adaptive: bool = False) -> OpsPerFrame:
+                  adaptive: bool = False, bypass: bool = False) -> OpsPerFrame:
     """Build the per-frame operation manifest for config (n_fft, hop).
 
     noise_est=True counts the noise-estimator update ops (active only while
     state == NOISE_EST); subtract=False yields the passthrough warm-up count.
     tracking=True / adaptive=True count the v2 ACTIVE-only meters (VAD-gated
     noise update, SNR estimate + alpha map) exactly as implemented in
-    spectral_subtraction.process_frame. The v1 manifest (defaults) is
-    unchanged - these counts are additive, never silently merged.
+    spectral_subtraction.process_frame. bypass=True models a revision 2.1
+    high-SNR bypass frame: meters + the SNR log2 still run (the decision needs
+    them) but the subtraction arithmetic and the alpha map are skipped (gain
+    pinned to 1.0). The v1 manifest (defaults) is unchanged - these counts are
+    additive, never silently merged.
     """
     if n_fft < 8 or n_fft & (n_fft - 1):
         raise ValueError(f"n_fft must be a power of two >= 8, got {n_fft}")
@@ -177,12 +185,17 @@ def ops_per_frame(n_fft: int, hop: int, *, noise_est: bool = False,
     #   tracking   : noise += mu*(mag - noise)          -> 1 mul + 2 add/bin
     #   snr log2   : one fixed-point log2 of the ratio  -> CYCLE_COST_LOG2
     #   alpha map  : linear map + 2 clamps + store      -> ~8 ops (assumed)
-    smooth_mults = bins * 4 if (tracking or adaptive) else 0
-    smooth_adds = bins * 3 if (tracking or adaptive) else 0
+    # The meters run whenever tracking, the alpha map, OR the high-SNR bypass
+    # needs the SNR read (bypass_frames skip the alpha map + subtraction but
+    # the log2 still runs for the decision).
+    meters_needed = tracking or adaptive or bypass
+    smooth_mults = bins * 4 if meters_needed else 0
+    smooth_adds = bins * 3 if meters_needed else 0
     track_mults = bins if tracking else 0
     track_adds = bins * 2 if tracking else 0
-    snr_logs = 1 if adaptive else 0
-    alpha_ops = 8 if adaptive else 0
+    snr_logs = 1 if (adaptive or bypass) else 0
+    alpha_ops = 8 if (adaptive and not bypass) else 0
+    subtract_active = subtract and not bypass
 
     return OpsPerFrame(
         n_fft=n_fft,
@@ -194,10 +207,10 @@ def ops_per_frame(n_fft: int, hop: int, *, noise_est: bool = False,
         magnitude_sqrts=bins,                        # one sqrt per bin
         noise_update_mults=bins * 2 if noise_est else 0,   # recursive avg
         noise_update_adds=bins * 2 if noise_est else 0,
-        subtract_mults=bins * 2 if subtract else 0,  # alpha*N/M then gain
-        subtract_divs=bins if subtract else 0,       # N[k]/M[k]
-        subtract_adds=bins * 2 if subtract else 0,   # 1 - x, clamp vs floor
-        reconstruct_mults=bins * 2,                  # gain * (re, im)
+        subtract_mults=bins * 2 if subtract_active else 0,  # alpha*N/M then gain
+        subtract_divs=bins if subtract_active else 0,       # N[k]/M[k]
+        subtract_adds=bins * 2 if subtract_active else 0,   # 1 - x, clamp vs floor
+        reconstruct_mults=bins * 2,                  # gain * (re, im) (runs even at gain=1)
         ola_adds=n_fft,                              # overlap-add accumulate
         ola_norm_mults=hop,                          # coverage normalization
         smooth_mults=smooth_mults,
@@ -244,7 +257,8 @@ def estimate_power_mw(n_fft: int, hop: int, fs: int, *,
                       noise_est: bool = False,
                       subtract: bool = True,
                       tracking: bool = False,
-                      adaptive: bool = False) -> PowerEstimate:
+                      adaptive: bool = False,
+                      bypass: bool = False) -> PowerEstimate:
     """Estimate per-frame cycles and the resulting core power draw.
 
     power_mW = cycles_per_frame * frames_per_second / (MOPS_per_mW * 1e6)
@@ -252,12 +266,18 @@ def estimate_power_mw(n_fft: int, hop: int, fs: int, *,
     using the cited peak efficiency (193 MOPS/mW). ops ~= cycles at ~1
     cycle/op IPC assumption (RV32IMC in-order); documented, not measured.
 
+    bypass=True models a revision 2.1 high-SNR bypass frame (subtraction and
+    alpha map skipped; meters + log2 kept for the decision). A stream that
+    mixes bypassed and non-bypassed frames draws BETWEEN the two estimates -
+    report both and the measured bypassed-frame count, never a single number.
+
     Cross-check view: effective_mhz = cycles_per_frame * frames_per_second /
     1e6, then dynamic power = effective_mhz * uW/MHz(65nm) on both ends of the
     published range.
     """
     manifest = ops_per_frame(n_fft, hop, noise_est=noise_est, subtract=subtract,
-                             tracking=tracking, adaptive=adaptive)
+                             tracking=tracking, adaptive=adaptive,
+                             bypass=bypass)
     ct = cycle_table or CycleTable()
 
     cycles = (
