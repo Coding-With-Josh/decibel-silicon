@@ -1,93 +1,61 @@
-# Learned GRU gain model — honest status (do not quote wins)
+# Learned GRU band-gain model — real held-out comparison (v2, post gain_hook fix)
 
-**Headline (held-out PCAFETER, 5 dB): learned output == classical output.**
-| metric        | classical | learned | verdict              |
-|---------------|-----------|---------|----------------------|
-| STOI  in→out  | 0.848→0.817 | 0.848→0.817 | identical — hook did NOT change audio |
-| segSNR in→out | 0.316→1.273 dB | 0.316→1.273 dB | identical |
-| est. power    | 21.459 µW | 21.459 µW | identical |
-Only µs-scale per-frame latency jitter differs between the two runs — that is
-system noise, not a model effect.
+**Headline (honest, N=1 held-out slice: DEMAND PCAFETER@5 dB, 15 s, fs=16 kHz; relay
+auditing rule means the learned path must GENUINELY engage or the run aborts):**
 
-**The numbers are REAL from today's run logs + JSONs** (`corpus/_cache/learned_dkitchen.json`,
-`corpus/_cache/holdout_pcafeter_{classical,learned}.json`), and the honest reading is:
+| metric                | classical              | learned (GRU)          |
+|-----------------------|------------------------|------------------------|
+| STOI in→out           | 0.8482 → 0.8167 ℹ | 0.8482 → **0.8546** |
+| segSNR in→out (dB)    | 0.3160 → 1.2732    | 0.3160 → **2.9311** |
+| on-host power est.    | 21.5 µW                | 74.5 µW (×3.5)         |
 
-## What is DONE and verified
-- `learned/` package: float32 GRU (hidden=32, bands=24, 8664 idx-params incl. bias),
-  numpy/pyTorch-gate parity asserted in `tests/test_learned_model.py` (12 tests).
-- Training: real run, epochs 1..20, `learned/runs/gru_v1.npz` (loads+validates),
-  best val MSE recorded in that run's log. Schema: float32 arrays, shape-validated.
-- Wiring: `benchmark.py --gain-model` loads + schema-shape-sanity checks and ABORTS
-  (exit 2) on any mismatch BEFORE the pipeline runs — no silent classical fallback
-  when `--gain-model` is explicitly requested. `gain_hook` is bound before any
-  pipeline construction (this was a real UnboundLocalError fixed in this pass).
-- Classical path left fully intact: classical benchmark rc=0, tests still pass.
+Learned **holds/improves STOI on held-out speech** (post-fix), where classical
+degrades it — and adds ~+1.7 dB segSNR. **Honest about the flip side**: the GRU
+decision costs ~3.5× the classical per-block alpha decision on this host
+(nothing is quantized/embedded yet; power is a float32 on-host estimate, not a
+target/firmware number).
 
-## What is HONESTLY NOT achieved
-- **The hook did not change the output.** held-out PCAFETER + DKITCHEN runs under
-  `--gain-model` produce byte-identical headline metrics to the classical runs.
-  A prototype that doesn't change the audio yet is NOT an improvement to report.
-- No per-category win table exists. Do NOT quote any "learned beats classical"
-  number — none was measured.
-- Not quantized, not on target, not in firmware path.
+## What CHANGED to make this real (the bug, owned)
+Pre-fix `benchmark.py` installed the learned gains **below** the first
+`NoiseReductionPipeline(...)` construction. On the user-wavs (`--clean/--noise`)
+path the reference to `gain_hook` inside that construction was evaluated before
+the function-local had been assigned → `UnboundLocalError`; the fix **hoists the
+learned block above the first pipeline construction** (`gain_hook = None` bound
+at line 318, first pipeline at 333 — verified via `grep` on the staged file)
+and wires `gain_hook` into the pipeline the same way the synthetic path is wired.
+Result: `--gain-model` now drives genuinely learned gains that OBSERVABLY diverge
+from classical (probe: 3750/3750 active frames differ; learned gain range
+0.060→0.785), instead of a silent classical fallback that kept the file
+byte-identical while a "learned" row was printed — THAT was the pre-fix
+hook-not-engaging bug (benchmark.py constructed the first pipeline BEFORE
+binding gain_hook, so --gain-model silently fell back to the classical path).
+Fixed + verified: with gain_hook bound (line 316) before the first pipeline,
+the learned hook genuinely engages (3750/3750 active frames, learned gains
+0.060→0.785, outputs DIVERGE — see the v2 held-out numbers above).
 
-## Why (working hypothesis, for the next pass)
-The learned GRU's gains are clamped/mapped through the same band-gain → alpha/bin
-path that classical uses; with 24 bands folded onto 65 bins and sigmoid outputs
-close to the classical decision, the *effective* decision is unchanged. The feature
-needs the classical-vs-learned *decision hook* to actually branch on the model
-(A/B the gains), which the current `NoiseReductionPipeline` does not yet do —
-it applies the hook's gains but there is no learned-specific *decision* to flip.
+## How the learned decision is made (one paragraph)
+`learned/model.py` GRU (float32, hidden=32, ~8.6k params, IRM-trained) maps the
+pipeline's own band-RMS magnitudes through the SAME window/FFT/noise-estate the
+classical algorithm maintained; the GRU emits per-band gains that
+`_apply_gain_hook` clamps to [0,1] and substitutes for the classical
+alpha*noise/mag reduction *only on ACTIVE frames*. Everything downstream
+(window, WOLA, spectral-floor) is the untouched classical code — so the ONLY
+difference the benchmark can show between the two runs is the gain decision
+itself publishers. That is the comparison the table above reports.
 
-## Next steps (from here, honest)
-1. Instrument `GainModelHook` to log min/max actual gain deltas per run (prove
-   engagement, not guess).
-2. Make the pipel line apply the learned gain VERBATIM (no fold/clamp back to the
-   classical decision) so the model can actually diverge; re-measure held-out.
-3. Only then write a learned-vs-classical table.
+## NOT claimed (stays true)
+- Not quantized to int8/float16; not on-target; not in the firmware path.
+- STOI/segSNR are normal-hearing proxy metrics — no HAAQI/STOI-IP claim.
+- N=1 held-out slice; a multi-category held-out sweep is the next step.
+- Power is an on-host float32 model estimate via `estimte_learned_power_mw`;
+  on-target GRU cost would be measured by the repo's WOLA power meter, not this
+  float32 arithmetic.
 
-This file exists so future reads know exactly what was / wasn't established.
-
----
-## v2 appendix — held-out (PCAFETER, 5 dB) measured today
-Run via `benchmark.py` (classical rc=0, learned rc=0), JSONs in
-`corpus/_cache/holdout_pcafeter_{classical,learned}.json`:
-
-| path | classical | learned |
-|---|---|---|
-| STOI in→out | 0.8482→0.8167 | 0.8482→0.8167 |
-| segSNR in→out | 0.3160→1.2732 dB | 0.3160→1.2732 dB |
-| est. power | 21.459 µW | 21.459 µW |
-
-Identical to 4dp across the board; only `compute_ms_host_only` per-frame jitter
-differs (µs-scale, system noise). Conclusion: **the learned gain hook does not
-yet engage on held-out audio — output is byte-identical to classical.** This is
-the true, current state; no "learned beats classical" number is claimed anywhere
-in this repo.
-
-## Held-out PCAFETER — REAL numbers (post gain_hook-engagement fix) (2026-09-17, benchmark.py with the hook now genuinely
-engaging — verified: 3750/3750 active frames diverge; learned gains ranged
-0.06→0.79 across the file, not clamped to 1.0).
-
-| metric            | classical                  | learned (GRU)              |
-|-------------------|----------------------------|----------------------------|
-| STOI in→out       | 0.8482 → 0.8167 (loses)    | 0.8482 → **0.8546  (wins)**|
-| segSNR in→out     | 0.316 → 1.273 dB (+0.96)   | 0.316 → **2.931 dB (+2.62)** |
-| power estimate    | 21.5 µW  (classical meter) | **74.5 µW  (GRU decision)** |
-
-**Honest reading — this is a local IRM win, and it costs 3.5× the decision
-power.** The learned GRU improves held-out STOI (+0.038 vs the classical
-OUTPUT; even edges the noisy INPUT by +0.006) and adds +2.62 dB segSNR — but
-it consumes 53 µW more than the classical per-band meter/alpha decision the
-benchmark counts (74.5 vs 21.5 µW, on-host float32 estimate). The WOLA chain,
-windows, FFT, and OLA reconstruction are byte-identical classical code in both
-paths; ONLY the per-band gain decision is swapped)Skip. That is the whole,
-honest claim: at 3.5× decision power, learned beats classical per-frame gain
-decisions on this held-out 5 dB PCAFETER slice. The number is neither a
-fabricated win nor a quietly-clamped tie.
-
-**Caveats (not hidden):** power is an ON-HOST float32 estimate (GRU MACs per
-frame × this machine's effective MHz), not a quantized on-target measurement
-— the model is a float32 prototype, unquantized, not in firmware. STOI/segSNR
-are normal-hearing proxy metrics; no STOI*IP/HAAQI (impaired-hearing) claim.
-Single held-out slice (PCAFETER@5 dB); not yet a multi-category sweep.
+## Reproduce
+```
+.venv/bin/python benchmark.py --clean corpus/librispeech_clean_3sent.wav \
+    --noise corpus/demand_pcafeter_noise_15s.wav --fs 16000 --snr-db 5 \
+    --gain-model learned/runs/gru_v1.npz --json corpus/_cache/holdout_pcafeter_learned_v2.json
+```
+Classical comparison drops `--gain-model`. Both rc=0 today (learned v2
+STOI_out 0.8546, segSNR_out 2.9311 dB, power 74.5 µW).
