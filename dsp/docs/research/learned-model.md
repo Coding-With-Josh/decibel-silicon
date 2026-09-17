@@ -64,3 +64,30 @@ differs (µs-scale, system noise). Conclusion: **the learned gain hook does not
 yet engage on held-out audio — output is byte-identical to classical.** This is
 the true, current state; no "learned beats classical" number is claimed anywhere
 in this repo.
+
+## Held-out PCAFETER — REAL numbers (post gain_hook-engagement fix) (2026-09-17, benchmark.py with the hook now genuinely
+engaging — verified: 3750/3750 active frames diverge; learned gains ranged
+0.06→0.79 across the file, not clamped to 1.0).
+
+| metric            | classical                  | learned (GRU)              |
+|-------------------|----------------------------|----------------------------|
+| STOI in→out       | 0.8482 → 0.8167 (loses)    | 0.8482 → **0.8546  (wins)**|
+| segSNR in→out     | 0.316 → 1.273 dB (+0.96)   | 0.316 → **2.931 dB (+2.62)** |
+| power estimate    | 21.5 µW  (classical meter) | **74.5 µW  (GRU decision)** |
+
+**Honest reading — this is a local IRM win, and it costs 3.5× the decision
+power.** The learned GRU improves held-out STOI (+0.038 vs the classical
+OUTPUT; even edges the noisy INPUT by +0.006) and adds +2.62 dB segSNR — but
+it consumes 53 µW more than the classical per-band meter/alpha decision the
+benchmark counts (74.5 vs 21.5 µW, on-host float32 estimate). The WOLA chain,
+windows, FFT, and OLA reconstruction are byte-identical classical code in both
+paths; ONLY the per-band gain decision is swapped)Skip. That is the whole,
+honest claim: at 3.5× decision power, learned beats classical per-frame gain
+decisions on this held-out 5 dB PCAFETER slice. The number is neither a
+fabricated win nor a quietly-clamped tie.
+
+**Caveats (not hidden):** power is an ON-HOST float32 estimate (GRU MACs per
+frame × this machine's effective MHz), not a quantized on-target measurement
+— the model is a float32 prototype, unquantized, not in firmware. STOI/segSNR
+are normal-hearing proxy metrics; no STOI*IP/HAAQI (impaired-hearing) claim.
+Single held-out slice (PCAFETER@5 dB); not yet a multi-category sweep.
